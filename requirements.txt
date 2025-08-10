@@ -1,7 +1,7 @@
-python-telegram-bot==20.6
-ccxt>=4.3.75
-pandas>=2.0.0
-numpy>=1.24.0
-python-dotenv>=1.0.0
-pytz>=2023.3
-python-telegram-bot[rate-limiter]
+python-telegram-bot==20.7
+ccxt==4.3.0
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==1.0.1
+aiofiles==23.2.1
+pytz==2024.1
