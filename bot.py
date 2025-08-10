@@ -1,4 +1,4 @@
-h#!/usr/bin/env python3
+#!/usr/bin/env python3
 # TopTrapHunterBot (fixed event loop with enhancements)
 # PTB v20+, Python 3.10+
 
