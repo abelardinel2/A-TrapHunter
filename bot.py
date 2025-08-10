@@ -24,7 +24,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-
+# File to store chat IDs
+CHAT_ID_FILE = "chat_ids.txt"
 # ------------------------- CONFIG -------------------------
 
 SYMBOLS_DEFAULT = ["BTC/USDT", "XRP/USDT", "XLM/USDT", "HBAR/USDT", "SUI/USDT", "LINK/USDT"]
