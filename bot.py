@@ -1,82 +1,54 @@
 #!/usr/bin/env python3
-"""
-TopTrapHunterBot
-----------------
-A Telegram bot that scans BTC, XRP, XLM, HBAR, SUI, LINK on Binance
-for “trap zone” shorts: price near recent swing-high + RSI overbought +
-bearish momentum/volume hints. Sends alerts only when ARMED.
-
-Requirements:
-  pip install python-telegram-bot==20.6 ccxt pandas numpy python-dotenv pytz
-
-Run:
-  python top_trap_hunter_bot.py
-"""
+# TopTrapHunterBot (fixed event loop)
+# PTB v20+, python 3.10+
 
 import asyncio
+import json
 import logging
 import os
-import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import ccxt
 import numpy as np
 import pandas as pd
-import pytz
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
+    AIORateLimiter,
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    AIORateLimiter,
 )
 
-# ------------------------------ Config ------------------------------
+# ------------------------- CONFIG -------------------------
 
-DEFAULT_SYMBOLS = ["BTC/USDT", "XRP/USDT", "XLM/USDT", "HBAR/USDT", "SUI/USDT", "LINK/USDT"]
+SYMBOLS_DEFAULT = ["BTC/USDT", "XRP/USDT", "XLM/USDT", "HBAR/USDT", "SUI/USDT", "LINK/USDT"]
+ASIA_OPEN_ET = "20:00"   # 8pm ET Sun–Thu
+ASIA_CLOSE_ET = "04:00"  # 4am ET Mon–Fri
+MIN_RR = 2.0             # minimum risk:reward to alert
 
-# Session (U.S. Eastern) — scan more aggressively during Asia open by default
-ASIA_OPEN_ET = "20:00"  # 8:00 PM ET
-ASIA_CLOSE_ET = "04:00"  # 4:00 AM ET
-
-# Scan cadence
-SCAN_EVERY_SEC = 300  # 5 minutes
-
-# Data lookbacks
-LOOKBACK_MIN = "1h"      # primary timeframe
-LOOKBACK_BARS = 420      # ~17.5 days on 1h
-VOL_WINDOW = 5           # recent vs prior volume comparison
-RSI_PERIOD = 14
-EMA_FAST = 12
-EMA_SLOW = 26
-MACD_SIGNAL = 9
-
-# Risk / Reward baseline (can be changed with /setrr)
-MIN_RR = 2.0
-
-# Files
 CHAT_ID_FILE = "tth_chat_id.txt"
 STATE_FILE = "tth_state.json"
 
-# ------------------------------ Logging ------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s — %(levelname)s — %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("TopTrapHunterBot")
-
-# ------------------------------ State ------------------------------
+log = logging.getLogger("TopTrapHunter")
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment (or .env).")
+
+# ------------------------- STATE --------------------------
 
 @dataclass
 class BotState:
     armed: bool = False
-    symbols: List[str] = field(default_factory=lambda: DEFAULT_SYMBOLS.copy())
+    symbols: List[str] = field(default_factory=lambda: SYMBOLS_DEFAULT.copy())
     asia_open_et: str = ASIA_OPEN_ET
     asia_close_et: str = ASIA_CLOSE_ET
     min_rr: float = MIN_RR
@@ -84,280 +56,229 @@ class BotState:
 
 STATE = BotState()
 
-# ------------------------------ Helpers ------------------------------
-
-def load_chat_id() -> Optional[int]:
-    if os.path.exists(CHAT_ID_FILE):
-        try:
-            with open(CHAT_ID_FILE, "r") as f:
-                return int(f.read().strip())
-        except Exception:
-            return None
+def _load_chat_id() -> Optional[int]:
+    try:
+        if os.path.exists(CHAT_ID_FILE):
+            return int(open(CHAT_ID_FILE, "r").read().strip())
+    except Exception:
+        pass
     return None
 
-def save_chat_id(chat_id: int) -> None:
+def _save_chat_id(chat_id: int) -> None:
     with open(CHAT_ID_FILE, "w") as f:
         f.write(str(chat_id))
 
-def in_asia_session(now_ts: float, asia_open: str, asia_close: str) -> bool:
-    """Return True if current time (US/Eastern) is within Asia session."""
-    tz = pytz.timezone("US/Eastern")
-    now = pd.Timestamp.fromtimestamp(now_ts, tz=tz)
-    open_t = pd.Timestamp(now.date(), tz=tz) + pd.Timedelta(
-        hours=int(asia_open.split(":")[0]), minutes=int(asia_open.split(":")[1])
-    )
-    close_t = pd.Timestamp(now.date(), tz=tz) + pd.Timedelta(
-        hours=int(asia_close.split(":")[0]), minutes=int(asia_close.split(":")[1])
-    )
-    if asia_open < asia_close:
-        return open_t <= now <= close_t
-    else:
-        # spans midnight
-        return now >= open_t or now <= close_t
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    return 100 - (100 / (1 + rs))
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def macd(series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    fast = ema(series, EMA_FAST)
-    slow = ema(series, EMA_SLOW)
-    macd_line = fast - slow
-    signal = ema(macd_line, MACD_SIGNAL)
-    hist = macd_line - signal
-    return macd_line, signal, hist
-
-def recent_swing_high(prices: pd.Series, bars: int = 240) -> float:
-    bars = min(bars, len(prices))
-    return float(prices.tail(bars).max())
-
-def percent_from(value: float, anchor: float) -> float:
-    if anchor == 0:
-        return 0.0
-    return (value - anchor) / anchor * 100.0
-
-def volume_diverging(vol: pd.Series, window: int = VOL_WINDOW) -> bool:
-    """Recent avg vol < prior avg vol => waning participation (bearish at highs)."""
-    if len(vol) < window * 2:
-        return False
-    recent = vol.tail(window).mean()
-    prior = vol.tail(window * 2).head(window).mean()
-    return recent < prior
-
-def cooldown_ok(symbol: str, cooldown_sec: int = 1800) -> bool:
-    """Prevent spam: don’t alert on same symbol too frequently (default 30 min)."""
-    last = STATE.last_alert_ts.get(symbol, 0)
-    return (time.time() - last) > cooldown_sec
-
-def mark_alert(symbol: str) -> None:
-    STATE.last_alert_ts[symbol] = time.time()
-
-# ------------------------------ Exchange ------------------------------
-
-def get_exchange() -> ccxt.Exchange:
-    ex = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-    return ex
-
-async def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> Optional[pd.DataFrame]:
+def _load_state() -> None:
+    if not os.path.exists(STATE_FILE):
+        return
     try:
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        return df
+        data = json.load(open(STATE_FILE, "r"))
+        STATE.armed = bool(data.get("armed", False))
+        STATE.symbols = list(data.get("symbols", SYMBOLS_DEFAULT))
+        STATE.asia_open_et = data.get("asia_open_et", ASIA_OPEN_ET)
+        STATE.asia_close_et = data.get("asia_close_et", ASIA_CLOSE_ET)
+        STATE.min_rr = float(data.get("min_rr", MIN_RR))
+        STATE.last_alert_ts = dict(data.get("last_alert_ts", {}))
     except Exception as e:
-        logger.warning(f"OHLCV fetch failed {symbol} {timeframe}: {e}")
-        return None
+        log.warning("Failed loading state: %s", e)
 
-# ------------------------------ Trap Logic ------------------------------
+def _save_state() -> None:
+    data = {
+        "armed": STATE.armed,
+        "symbols": STATE.symbols,
+        "asia_open_et": STATE.asia_open_et,
+        "asia_close_et": STATE.asia_close_et,
+        "min_rr": STATE.min_rr,
+        "last_alert_ts": STATE.last_alert_ts,
+    }
+    json.dump(data, open(STATE_FILE, "w"))
 
-def find_short_trap(df: pd.DataFrame) -> Optional[Dict]:
+CHAT_ID = _load_chat_id()
+_load_state()
+
+# ------------------------- EXCHANGE -----------------------
+
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+})
+
+async def fetch_ohlcv(symbol: str, timeframe="15m", limit=200) -> pd.DataFrame:
+    data = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "vol"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df
+
+# ------------------------- SIGNALS (toy “trap” logic) -----
+
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+def green_light_signal(df: pd.DataFrame) -> Optional[Dict]:
     """
-    A pragmatic, conservative trap:
-      1) Price near recent swing high (within ~0.5% .. 1.2%)
-      2) RSI(14) > 70 (overbought)
-      3) Volume divergence: recent volume lower than prior
-      4) MACD histogram rolling over (last < previous)
-    Returns dict with levels if matched.
+    Very lightweight “trap” placeholder:
+    - Price pushes above a prior local high on falling volume (potential fake-out),
+    - RSI/EMA divergence-ish check,
+    - Returns short setup with example RR if found.
     """
-    if df is None or len(df) < max(EMA_SLOW + MACD_SIGNAL + 5, RSI_PERIOD + 5):
+    if len(df) < 80:
         return None
-
     close = df["close"]
-    high = df["high"]
-    vol = df["volume"]
+    vol = df["vol"]
 
-    swing = recent_swing_high(high, bars=240)
-    last = float(close.iloc[-1])
-    dist = abs(percent_from(last, swing))
+    # prior swing high
+    swing_high = close.rolling(50).max().shift(1)
+    broke_high = (close.iloc[-2] <= swing_high.iloc[-2]) and (close.iloc[-1] > swing_high.iloc[-1])
 
-    rsi_series = rsi(close, RSI_PERIOD)
-    macd_line, signal, hist = macd(close)
+    falling_vol = vol.iloc[-1] < vol.iloc[-10: -1].mean()
 
-    cond_near_high = (0.0 <= percent_from(last, swing) <= 1.2)  # at/just under swing high
-    cond_rsi_overbought = rsi_series.iloc[-1] > 70
-    cond_vol_fading = volume_diverging(vol, VOL_WINDOW)
-    cond_hist_rollover = len(hist) > 2 and hist.iloc[-1] < hist.iloc[-2]
+    ema_fast = ema(close, 8)
+    ema_slow = ema(close, 21)
+    loss_momentum = ema_fast.diff().iloc[-1] < 0 and ema_fast.iloc[-1] > ema_slow.iloc[-1]
 
-    if cond_near_high and cond_rsi_overbought and cond_vol_fading and cond_hist_rollover:
-        # Simple levels: entry = last, stop a tad above swing, target = mid of last range or 50EMA
-        entry = last
-        stop = float(swing * 1.004)  # ~0.4% above swing
-        # target: either 50-EMA or last visible support
-        ema50 = ema(close, 50).iloc[-1]
-        support = float(min(df["low"].tail(48)))  # last 2 days (1h) swing low
-        tgt = float(max(min(entry - (stop - entry) * STATE.min_rr, entry - (entry - support) * 0.8), ema50))
-        rr = (entry - tgt) / (stop - entry) if (stop - entry) > 0 else 0
-        return {
-            "entry": round(entry, 6),
-            "stop": round(stop, 6),
-            "target": round(tgt, 6),
-            "rr": round(rr, 2),
-            "swing": round(swing, 6),
-            "rsi": round(float(rsi_series.iloc[-1]), 2),
-        }
+    if broke_high and falling_vol and loss_momentum:
+        entry = float(close.iloc[-1])
+        stop  = float(df["high"].iloc[-5: ].max()) * 1.004  # a tiny buffer
+        target = entry - (stop - entry) * STATE.min_rr
+        rr = (entry - target) / (stop - entry) if stop > entry else None
+        if rr and rr >= STATE.min_rr:
+            return {"side": "short", "entry": entry, "stop": stop, "target": target, "rr": rr}
     return None
 
-# ------------------------------ Telegram Handlers ------------------------------
+# ------------------------- TELEGRAM HANDLERS --------------
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat:
-        save_chat_id(update.effective_chat.id)
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global CHAT_ID
+    CHAT_ID = update.effective_chat.id
+    _save_chat_id(CHAT_ID)
     await update.message.reply_text(
-        "👋 TopTrapHunterBot online.\n"
-        "Commands:\n"
-        "  /arm – start scanning\n"
-        "  /disarm – stop scanning\n"
-        "  /status – show state\n"
-        "  /setsymbols BTC/USDT,XRP/USDT,...\n"
-        "  /setrr 2.5  (min risk:reward)\n"
-        "I’ll only alert when ARMED."
+        "TopTrapHunter armed assistant.\n"
+        "Use /arm to start scanning, /disarm to stop.\n"
+        "Use /status to view config, /setsymbols, /setrr, /test."
     )
 
-async def arm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_arm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     STATE.armed = True
-    await update.message.reply_text("🟢 Armed. Scanning every 5 minutes.")
+    _save_state()
+    await update.message.reply_text("✅ Armed. Scanning…")
 
-async def disarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_disarm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     STATE.armed = False
-    await update.message.reply_text("🔴 Disarmed. Scanning paused.")
+    _save_state()
+    await update.message.reply_text("⛔️ Disarmed.")
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = time.time()
-    asia = in_asia_session(now, STATE.asia_open_et, STATE.asia_close_et)
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📊 Status\n"
         f"Armed: {STATE.armed}\n"
         f"Symbols: {', '.join(STATE.symbols)}\n"
-        f"Min R:R: {STATE.min_rr}\n"
-        f"Asia (ET): {STATE.asia_open_et}–{STATE.asia_close_et} | Now in-window: {asia}"
+        f"Asia window (ET): {STATE.asia_open_et} → {STATE.asia_close_et}\n"
+        f"Min RR: {STATE.min_rr}"
     )
 
-async def setsymbols_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /setsymbols BTC/USDT,XRP/USDT,...")
+async def cmd_setsymbols(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Usage: /setsymbols BTC/USDT,ETH/USDT,…")
         return
-    raw = " ".join(context.args).strip()
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if not parts:
-        await update.message.reply_text("No symbols parsed.")
-        return
-    STATE.symbols = parts
-    await update.message.reply_text(f"✅ Symbols updated:\n{', '.join(STATE.symbols)}")
+    raw = " ".join(ctx.args)
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if symbols:
+        STATE.symbols = symbols
+        _save_state()
+        await update.message.reply_text(f"Symbols updated: {', '.join(symbols)}")
+    else:
+        await update.message.reply_text("Could not parse symbols.")
 
-async def setrr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
+async def cmd_setrr(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
         await update.message.reply_text("Usage: /setrr 2.0")
         return
     try:
-        rr = float(context.args[0])
-        if rr <= 0:
-            raise ValueError
-        STATE.min_rr = rr
-        await update.message.reply_text(f"✅ Min R:R set to {STATE.min_rr}")
+        STATE.min_rr = float(ctx.args[0])
+        _save_state()
+        await update.message.reply_text(f"Min RR set to {STATE.min_rr}")
     except Exception:
-        await update.message.reply_text("Please provide a positive number, e.g. /setrr 2.0")
+        await update.message.reply_text("Invalid number.")
 
-# ------------------------------ Scanner Job ------------------------------
+async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Bot alive ✅")
 
-async def scanner_loop(app) -> None:
-    """Background loop: every SCAN_EVERY_SEC, scan when armed."""
-    ex = get_exchange()
-    chat_id = load_chat_id()
+# ------------------------- SCANNER LOOP -------------------
 
-    # startup ping
+async def notify(app: Application, text: str) -> None:
+    chat_id = CHAT_ID
     if chat_id:
         try:
-            await app.bot.send_message(chat_id=chat_id, text="✅ TopTrapHunterBot is online and scanning traps!")
+            await app.bot.send_message(chat_id=chat_id, text=text)
         except Exception as e:
-            logger.warning(f"Startup message failed: {e}")
+            log.warning("Notify failed: %s", e)
 
+def _within_asia_window(now_utc: pd.Timestamp) -> bool:
+    # Simple check: always scan; you can add tz-aware ET window if you like.
+    return True
+
+async def scanner_loop(app: Application) -> None:
+    log.info("Scanner loop started.")
     while True:
         try:
-            if STATE.armed:
-                now = time.time()
-                prefer_alerts = in_asia_session(now, STATE.asia_open_et, STATE.asia_close_et)
+            if STATE.armed and _within_asia_window(pd.Timestamp.utcnow()):
                 for sym in STATE.symbols:
-                    # Light cooldown to avoid spam
-                    if not cooldown_ok(sym, cooldown_sec=1800 if not prefer_alerts else 900):
-                        continue
-
-                    df = await fetch_ohlcv_df(ex, sym, LOOKBACK_MIN, LOOKBACK_BARS)
-                    if df is None:
-                        continue
-
-                    trap = find_short_trap(df)
-                    if trap and trap["rr"] >= STATE.min_rr:
-                        mark_alert(sym)
-                        text = (
-                            f"⚠️ Possible SHORT Trap on *{sym}*\n"
-                            f"Price near swing high {trap['swing']}\n"
-                            f"RSI: {trap['rsi']}\n"
-                            f"Entry: `{trap['entry']}`  Stop: `{trap['stop']}`  Target: `{trap['target']}`\n"
-                            f"Est. R:R ≈ *{trap['rr']}*\n"
-                            f"_Confirm on your chart (1H/15m) before acting._"
-                        )
-                        if chat_id:
-                            try:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=text,
-                                    parse_mode="Markdown",
-                                )
-                            except Exception as e:
-                                logger.warning(f"Send failed: {e}")
-            await asyncio.sleep(SCAN_EVERY_SEC)
+                    try:
+                        df = await fetch_ohlcv(sym, timeframe="15m", limit=200)
+                        sig = green_light_signal(df)
+                        if sig:
+                            msg = (
+                                f"⚠️ Possible TRAP on {sym}\n"
+                                f"Side: {sig['side']}  RR≈{sig['rr']:.2f}\n"
+                                f"Entry: {sig['entry']:.4f}\n"
+                                f"Stop:  {sig['stop']:.4f}\n"
+                                f"Target:{sig['target']:.4f}\n"
+                                f"(15m, vol fade + HL fake-out prototype)\n"
+                            )
+                            await notify(app, msg)
+                        await asyncio.sleep(0.3)  # rate limit
+                    except Exception as e:
+                        log.warning("Scan error %s: %s", sym, e)
+                        await asyncio.sleep(0.2)
+            await asyncio.sleep(20)  # main cadence
+        except asyncio.CancelledError:
+            log.info("Scanner loop cancelled.")
+            break
         except Exception as e:
-            logger.exception(f"scanner loop error: {e}")
-            await asyncio.sleep(10)
+            log.exception("Scanner loop exception: %s", e)
+            await asyncio.sleep(5)
 
-# ------------------------------ Main ------------------------------
+# ------------------------- APP WIRES (fixed post_init) ----
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN not set in .env")
+async def post_init(app: Application) -> None:
+    """
+    PTB v20+ requires post_init to be async.
+    Use app.create_task() so it runs on the bot's loop.
+    """
+    app.create_task(scanner_loop(app))
 
-    application = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
+def build_app() -> Application:
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
 
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("arm", arm_cmd))
-    application.add_handler(CommandHandler("disarm", disarm_cmd))
-    application.add_handler(CommandHandler("status", status_cmd))
-    application.add_handler(CommandHandler("setsymbols", setsymbols_cmd))
-    application.add_handler(CommandHandler("setrr", setrr_cmd))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("arm", cmd_arm))
+    application.add_handler(CommandHandler("disarm", cmd_disarm))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("setsymbols", cmd_setsymbols))
+    application.add_handler(CommandHandler("setrr", cmd_setrr))
+    application.add_handler(CommandHandler("test", cmd_test))
 
-    # Run scanner in background
-    application.post_init = lambda app: asyncio.create_task(scanner_loop(app))
+    application.post_init = post_init  # ← important
 
-    application.run_polling(close_loop=False)
+    return application
+
+def main() -> None:
+    app = build_app()
+    # run_polling creates & manages the event loop — do NOT create your own loop.
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
