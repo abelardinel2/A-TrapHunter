@@ -1,0 +1,6 @@
+python-telegram-bot==20.6
+ccxt>=4.3.75
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+pytz>=2023.3
