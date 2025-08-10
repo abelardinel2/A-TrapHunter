@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+h#!/usr/bin/env python3
 # TopTrapHunterBot (fixed event loop with enhancements)
 # PTB v20+, Python 3.10+
 
@@ -147,4 +147,4 @@ async def green_light_signal(df: pd.DataFrame, symbol: str) -> Optional[Dict]:
         return None
     close = df["close"]
     vol = df["vol"]
-    swing_high = close.rolling(50
+    swing_high = close.rolling(window=50).max()
